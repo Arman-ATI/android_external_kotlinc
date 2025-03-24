@@ -5,9 +5,16 @@
 # Copyright 2010-2021 JetBrains s.r.o. and Kotlin Programming Language contributors.
 # Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
 
-cygwin=false;
-case "`uname`" in
-    CYGWIN*) cygwin=true ;;
+# Performance-optimized version with daemon support, parallel compilation, and better memory settings
+
+# OS detection
+cygwin=false
+darwin=false
+mingw=false
+case "$(uname)" in
+  CYGWIN*) cygwin=true ;;
+  Darwin*) darwin=true ;;
+  MINGW*) mingw=true ;;
 esac
 
 # Based on findScalaHome() from scalac script
@@ -15,32 +22,83 @@ findKotlinHome() {
     local source="${BASH_SOURCE[0]}"
     while [ -h "$source" ] ; do
         local linked="$(readlink "$source")"
-        local dir="$(cd -P $(dirname "$source") && cd -P $(dirname "$linked") && pwd)"
+        local dir="$(cd -P "$(dirname "$source")" && cd -P "$(dirname "$linked")" && pwd)"
         source="$dir/$(basename "$linked")"
     done
     (cd -P "$(dirname "$source")/.." && pwd)
 }
 
 findJavaVersion() {
-    # Note that this only loads the first component of the version, so "1.8.0_265" -> "1".
-    # But it's fine because major version is 9 for JDK 9, and so on.
-    regex='^.*version "([[:digit:]]+).*$'
-    while read -r line; do
-        if [[ "$line" =~ $regex ]]; then
-            echo ${BASH_REMATCH[1]}
-        fi
-    done <<< $("${JAVACMD:=java}" -version 2>&1)
+    # Parse Java version to get major version number
+    local java_cmd="${JAVACMD:=java}"
+    
+    # Handle potential spaces in Java path
+    if $cygwin || $mingw; then
+        java_cmd=$(cygpath --unix "$java_cmd")
+    fi
+    
+    "$java_cmd" -version 2>&1 | grep -i version | head -n 1 | cut -d'"' -f2 | cut -d'.' -f1
+}
+
+# Find processor count for parallel compilation
+getProcessorCount() {
+    if [ -f /proc/cpuinfo ]; then
+        grep -c ^processor /proc/cpuinfo
+    elif $darwin; then
+        sysctl -n hw.ncpu
+    else
+        echo 4  # Default if we can't detect
+    fi
 }
 
 KOTLIN_HOME="$(findKotlinHome)"
 
-if $cygwin; then
-    # Remove spaces from KOTLIN_HOME on windows
-    KOTLIN_HOME=`cygpath --windows --short-name "$KOTLIN_HOME"`
+# Path normalization for Windows
+if $cygwin || $mingw; then
+    # Convert paths for Java use
+    [ -n "$KOTLIN_HOME" ] && KOTLIN_HOME=$(cygpath --windows "$KOTLIN_HOME")
+    [ -n "$KOTLIN_BUILD_CACHE_DIR" ] && KOTLIN_BUILD_CACHE_DIR=$(cygpath --windows "$KOTLIN_BUILD_CACHE_DIR")
 fi
 
-[ -n "$JAVA_OPTS" ] || JAVA_OPTS="-Xmx256M -Xms128M"
+# Performance-tuned default JVM options
+if [ -z "$JAVA_OPTS" ]; then
+    # Detect available memory and set heap accordingly (up to 4GB)
+    if [ -f /proc/meminfo ]; then
+        MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        MEM_MB=$((MEM_KB / 1024))
+        HEAP_SIZE=$((MEM_MB / 4))
+        # Cap at 4GB
+        [ "$HEAP_SIZE" -gt 4096 ] && HEAP_SIZE=4096
+        # Minimum 1GB
+        [ "$HEAP_SIZE" -lt 1024 ] && HEAP_SIZE=1024
+    else
+        # Default to 2GB if we can't detect
+        HEAP_SIZE=2048
+    fi
+    
+    JAVA_OPTS="-Xmx${HEAP_SIZE}M -Xms${HEAP_SIZE}M -XX:+UseParallelGC"
+    
+    # Add GC tuning for large projects
+    JAVA_OPTS="$JAVA_OPTS -XX:+UseStringDeduplication -XX:StringTableSize=1000003"
+    
+    # Add class data sharing for faster startup
+    JAVA_OPTS="$JAVA_OPTS -XX:+UseCompressedClassPointers -XX:+UseCompressedOops"
+fi
 
+# Configure incremental compilation (enabled by default)
+[ -z "$KOTLIN_INCREMENTAL" ] && KOTLIN_INCREMENTAL=true
+
+# Configure compiler daemon (enabled by default)
+[ -z "$KOTLIN_DAEMON_ENABLED" ] && KOTLIN_DAEMON_ENABLED=true
+
+# Configure parallel compilation threads
+[ -z "$KOTLIN_COMPILER_THREADS" ] && KOTLIN_COMPILER_THREADS=$(getProcessorCount)
+
+# Configure build cache
+[ -z "$KOTLIN_BUILD_CACHE_DIR" ] && KOTLIN_BUILD_CACHE_DIR="$HOME/.kotlin/cache"
+[ -n "$KOTLIN_BUILD_CACHE_DIR" ] && mkdir -p "$KOTLIN_BUILD_CACHE_DIR"
+
+# Process arguments
 declare -a java_args
 declare -a kotlin_args
 
@@ -65,16 +123,42 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Find Java executable
 if [ -z "$JAVACMD" -a -n "$JAVA_HOME" -a -x "$JAVA_HOME/bin/java" ]; then
     JAVACMD="$JAVA_HOME/bin/java"
+fi
+
+# Apply performance options
+if [ "$KOTLIN_INCREMENTAL" = true ]; then
+    kotlin_args=("${kotlin_args[@]}" "-Xincremental")
+fi
+
+if [ "$KOTLIN_DAEMON_ENABLED" = true ]; then
+    kotlin_args=("${kotlin_args[@]}" "-Xuse-daemon")
+    
+    # Add daemon worker heap configuration 
+    if [ -n "$KOTLIN_DAEMON_WORKER_HEAP" ]; then
+        kotlin_args=("${kotlin_args[@]}" "-Xdaemon-worker-jvm-options=-Xmx${KOTLIN_DAEMON_WORKER_HEAP}")
+    fi
+fi
+
+if [ -n "$KOTLIN_COMPILER_THREADS" ]; then
+    kotlin_args=("${kotlin_args[@]}" "-Xparallel-backend-threads=$KOTLIN_COMPILER_THREADS")
+fi
+
+if [ -n "$KOTLIN_BUILD_CACHE_DIR" ]; then
+    kotlin_args=("${kotlin_args[@]}" "-Xbuild-cache-dir=$KOTLIN_BUILD_CACHE_DIR")
 fi
 
 declare -a kotlin_app
 
 java_version="$(findJavaVersion)"
-if [[ $java_version -ge 9 ]]; then
-    # Workaround the illegal reflective access warning from ReflectionUtil to ResourceBundle.setParent, see IDEA-248785.
+if [ "$java_version" -ge 9 ]; then
+    # Add modules and reflection access for Java 9+
     java_args=("${java_args[@]}" "--add-opens" "java.base/java.util=ALL-UNNAMED")
+    java_args=("${java_args[@]}" "--add-opens" "java.base/java.lang=ALL-UNNAMED")
+    java_args=("${java_args[@]}" "--add-opens" "java.base/java.lang.reflect=ALL-UNNAMED")
+    java_args=("${java_args[@]}" "--add-opens" "java.base/java.io=ALL-UNNAMED")
 fi
 
 if [ -n "$KOTLIN_RUNNER" ]; then
@@ -83,7 +167,7 @@ if [ -n "$KOTLIN_RUNNER" ]; then
 else
     [ -n "$KOTLIN_COMPILER" ] || KOTLIN_COMPILER=org.jetbrains.kotlin.cli.jvm.K2JVMCompiler
 
-    if [[ $java_version < 13 ]]; then
+    if [ "$java_version" -lt 13 ]; then
         java_args=("${java_args[@]}" "-noverify")
     fi
 
@@ -91,8 +175,26 @@ else
     if [ -n "$KOTLIN_TOOL" ]; then
         additional_classpath=":${KOTLIN_HOME}/lib/${KOTLIN_TOOL}"
     fi
+    
+    # Add custom classpath if specified
+    if [ -n "$KOTLIN_CLASSPATH" ]; then
+        additional_classpath="${additional_classpath}:${KOTLIN_CLASSPATH}"
+    fi
 
     kotlin_app=("${KOTLIN_HOME}/lib/kotlin-preloader.jar" "org.jetbrains.kotlin.preloading.Preloader" "-cp" "${KOTLIN_HOME}/lib/kotlin-compiler.jar${additional_classpath}" $KOTLIN_COMPILER)
 fi
 
+# Print configuration if verbose mode is enabled
+if [ "$KOTLIN_VERBOSE" = true ]; then
+    echo "Kotlin compiler configuration:"
+    echo "  KOTLIN_HOME: $KOTLIN_HOME"
+    echo "  JAVA_OPTS: $JAVA_OPTS"
+    echo "  Incremental compilation: $KOTLIN_INCREMENTAL"
+    echo "  Daemon enabled: $KOTLIN_DAEMON_ENABLED"
+    echo "  Compiler threads: $KOTLIN_COMPILER_THREADS"
+    echo "  Build cache: $KOTLIN_BUILD_CACHE_DIR"
+    echo "  Java version: $java_version"
+fi
+
+# Execute the Kotlin compiler
 "${JAVACMD:=java}" $JAVA_OPTS "${java_args[@]}" -cp "${kotlin_app[@]}" "${kotlin_args[@]}"
